@@ -75,7 +75,9 @@ FRONT_DEVICE=/dev/video0 REAR_DEVICE=/dev/video1 DASHCAM_FPS=30 DASHCAM_SIZE=128
 - 映像コーデック: H.264 `libx264`
 - 映像ビットレート: `3M`
 - ラップ長: 10分
-- 容量上限: フロント30GB、リア30GB、合計約60GB
+- 常時録画: フロント100本、リア100本
+- イベント録画: フロント3本、リア3本
+- 手動録画: フロント3本、リア3本
 
 変更したい場合:
 
@@ -83,7 +85,6 @@ FRONT_DEVICE=/dev/video0 REAR_DEVICE=/dev/video1 DASHCAM_FPS=30 DASHCAM_SIZE=128
 export DASHCAM_FPS=27.5
 export DASHCAM_VIDEO_BITRATE=3M
 export DASHCAM_VIDEO_CODEC=libx264
-export DASHCAM_MAX_BYTES_PER_CAMERA=32212254720
 ```
 
 ## 操作
@@ -129,7 +130,8 @@ DASHCAM_MEDIA_DIR=/home/pi/videos FRONT_DEVICE=/dev/video0 REAR_DEVICE=/dev/vide
 - 手動記録
 - イベント記録
 - トリガー時点の前1ラップ、現在1ラップ、後1ラップ保存
-- フロント/リア合計60GB相当のループ削除
+- 常時録画はフロント/リア各100本を上限に古い順で削除
+- イベント録画と手動録画は各3本を上限に4本目の保存前に最古を削除
 - ローカルWebビューア向けフォルダ構成
 
 未実装または別プロセス想定:
