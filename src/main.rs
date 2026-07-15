@@ -12,10 +12,11 @@ use std::{
     time::Duration,
 };
 
-const DEFAULT_MAX_BYTES_PER_CAMERA: u64 = 30 * 1024 * 1024 * 1024;
 const CLIP_SECONDS: &str = "600";
 const BEFORE_LAPS: usize = 1;
 const CURRENT_AND_AFTER_LAPS: usize = 2;
+const CONTINUOUS_MAX_FILES: usize = 100;
+const SAVED_MAX_FILES: usize = 3;
 
 const DEFAULT_MEDIA_DIR: &str = "videos";
 
@@ -29,7 +30,6 @@ struct CameraConfig {
     size: String,
     video_codec: String,
     video_bitrate: String,
-    max_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -62,18 +62,6 @@ fn env_value(names: &[&str], default: &str) -> String {
     }
 
     default.to_string()
-}
-
-fn env_u64(names: &[&str], default: u64) -> u64 {
-    for name in names {
-        if let Ok(value) = env::var(name) {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                return parsed;
-            }
-        }
-    }
-
-    default
 }
 
 fn default_input_format() -> &'static str {
@@ -112,7 +100,6 @@ fn camera_config(
     let size_name = format!("{upper_role}_SIZE");
     let video_codec_name = format!("{upper_role}_VIDEO_CODEC");
     let video_bitrate_name = format!("{upper_role}_VIDEO_BITRATE");
-    let max_bytes_name = format!("{upper_role}_MAX_BYTES");
 
     CameraConfig {
         role: role.to_string(),
@@ -126,10 +113,6 @@ fn camera_config(
         size: env_value(&[&size_name, "DASHCAM_SIZE"], "1280x720"),
         video_codec: env_value(&[&video_codec_name, "DASHCAM_VIDEO_CODEC"], "libx264"),
         video_bitrate: env_value(&[&video_bitrate_name, "DASHCAM_VIDEO_BITRATE"], "3M"),
-        max_bytes: env_u64(
-            &[&max_bytes_name, "DASHCAM_MAX_BYTES_PER_CAMERA"],
-            DEFAULT_MAX_BYTES_PER_CAMERA,
-        ),
     }
 }
 
@@ -311,6 +294,7 @@ fn save_pending_clips(config: &CameraConfig, pending: PendingSave) -> io::Result
         ));
 
         if src_video.exists() {
+            cleanup_saved_files(config, &pending.target, SAVED_MAX_FILES - 1)?;
             match fs::copy(&src_video, &dst_video) {
                 Ok(_) => saved += 1,
                 Err(err) => eprintln!(
@@ -338,6 +322,70 @@ fn save_pending_clips(config: &CameraConfig, pending: PendingSave) -> io::Result
     Ok(())
 }
 
+fn collect_saved_videos(directory: &Path, videos: &mut Vec<PathBuf>) -> io::Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_saved_videos(&path, videos)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("mp4") {
+            videos.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_video_with_thumbnail(video_path: &Path) -> io::Result<()> {
+    let file_name = video_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "動画名を取得できません"))?;
+    let thumb_path = video_path.with_file_name(thumb_name_for(file_name));
+
+    fs::remove_file(video_path)?;
+    if let Err(err) = fs::remove_file(&thumb_path) {
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(err);
+        }
+    }
+
+    if let Some(parent) = video_path.parent() {
+        if fs::read_dir(parent)?.next().is_none() {
+            fs::remove_dir(parent)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_saved_files(
+    config: &CameraConfig,
+    target: &str,
+    files_to_keep_before_save: usize,
+) -> io::Result<()> {
+    let category_dir = camera_base_dir(config).join(target);
+    let mut videos = Vec::new();
+    collect_saved_videos(&category_dir, &mut videos)?;
+    videos.sort();
+
+    while videos.len() > files_to_keep_before_save {
+        let oldest_video = videos.remove(0);
+        remove_video_with_thumbnail(&oldest_video)?;
+        println!(
+            "[{}{}整理] 新しい録画の保存前に最古の録画 {} を削除しました。",
+            config.label,
+            target,
+            oldest_video.display()
+        );
+    }
+
+    Ok(())
+}
+
 fn cleanup_old_files(config: &CameraConfig, state: &Arc<Mutex<RecorderState>>) -> io::Result<()> {
     let protected_files = {
         let state = state.lock().expect("recorder state mutex poisoned");
@@ -349,39 +397,29 @@ fn cleanup_old_files(config: &CameraConfig, state: &Arc<Mutex<RecorderState>>) -
     };
 
     let mut videos = Vec::new();
-    let mut total_bytes = 0_u64;
     for entry in fs::read_dir(continuous_dir(config))? {
         let path = entry?.path();
         if path.extension().and_then(|ext| ext.to_str()) == Some("mp4") {
             if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
-                let video_bytes = fs::metadata(&path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                let thumb_path = continuous_dir(config).join(thumb_name_for(file_name));
-                let thumb_bytes = fs::metadata(&thumb_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                total_bytes += video_bytes + thumb_bytes;
-                videos.push((file_name.to_string(), video_bytes + thumb_bytes));
+                videos.push(file_name.to_string());
             }
         }
     }
 
-    videos.sort_by(|left, right| left.0.cmp(&right.0));
+    videos.sort();
 
-    while total_bytes > config.max_bytes {
-        let (oldest_video, oldest_bytes) = videos.remove(0);
-
-        if protected_files.contains(&oldest_video) {
-            if videos.is_empty() {
-                break;
-            }
-            continue;
-        }
+    while videos.len() > CONTINUOUS_MAX_FILES {
+        let Some(oldest_index) = videos
+            .iter()
+            .position(|video| !protected_files.contains(video))
+        else {
+            break;
+        };
+        let oldest_video = videos.remove(oldest_index);
 
         match fs::remove_file(continuous_dir(config).join(&oldest_video)) {
             Ok(_) => println!(
-                "[{}容量確保] 古い録画 {} を削除しました。",
+                "[{}通常録画整理] 101本目の録画完了後に最古の録画 {} を削除しました。",
                 config.label, oldest_video
             ),
             Err(err) => eprintln!("[{}削除エラー] {}: {err}", config.label, oldest_video),
@@ -397,8 +435,6 @@ fn cleanup_old_files(config: &CameraConfig, state: &Arc<Mutex<RecorderState>>) -
                 );
             }
         }
-
-        total_bytes = total_bytes.saturating_sub(oldest_bytes);
     }
 
     Ok(())
@@ -475,7 +511,7 @@ fn recorder_loop(
 ) -> io::Result<()> {
     ensure_dirs(&config)?;
     println!(
-        "[{}設定] input_format={}, device={}, fps={}, size={}, codec={}, bitrate={}, max_bytes={}",
+        "[{}設定] input_format={}, device={}, fps={}, size={}, codec={}, bitrate={}, continuous_max_files={}",
         config.label,
         config.input_format,
         config.device,
@@ -483,7 +519,7 @@ fn recorder_loop(
         config.size,
         config.video_codec,
         config.video_bitrate,
-        config.max_bytes
+        CONTINUOUS_MAX_FILES
     );
     initialize_camera(&config)?;
 
